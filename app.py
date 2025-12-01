@@ -4,6 +4,8 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from docx import Document
 import io
+import zipfile
+import datetime as dt
 
 # ======================
 #  UTILIDADES DE TEXTO
@@ -11,7 +13,7 @@ import io
 
 UNIDADES = (
     "cero", "uno", "dos", "tres", "cuatro", "cinco", "seis",
-    "siete", "ocho", "nueve", "diez", "once", "dos­ce", "trece",
+    "siete", "ocho", "nueve", "diez", "once", "doce", "trece",
     "catorce", "quince", "dieciséis", "diecisiete", "dieciocho",
     "diecinueve", "veinte"
 )
@@ -53,6 +55,12 @@ def numero_a_letras_centavos(n: int) -> str:
 
 
 def numero_a_letras_pesos(valor: float) -> str:
+    """
+    Ejemplo:
+    65331719.38 ->
+    'sesenta y cinco millones trescientos treinta y un mil
+     setecientos diecinueve pesos con treinta y ocho centavos'
+    """
     v = Decimal(str(valor)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     entero = int(v)
     centavos = int((v - Decimal(entero)) * 100)
@@ -61,18 +69,22 @@ def numero_a_letras_pesos(valor: float) -> str:
     miles, unidades = divmod(resto, 1_000)
 
     partes = []
+
+    # Millones
     if millones > 0:
         if millones == 1:
             partes.append("un millón")
         else:
             partes.append(numero_a_letras_menor_1000(millones) + " millones")
 
+    # Miles
     if miles > 0:
         if miles == 1:
             partes.append("mil")
         else:
             partes.append(numero_a_letras_menor_1000(miles) + " mil")
 
+    # Unidades
     if unidades > 0 or entero == 0:
         partes.append(numero_a_letras_menor_1000(unidades))
 
@@ -88,26 +100,87 @@ def numero_a_letras_pesos(valor: float) -> str:
 #  LECTURA DE USURA
 # ======================
 
-def cargar_usura(path: str):
+def cargar_usura(path: str) -> pd.DataFrame:
+    """
+    Lee TASAS_DE_USURA.xlsx y normaliza a columnas:
+    - fecha_desde (date)
+    - tasa_ea (decimal E.A.)
+    Soporta archivos con columnas:
+    - 'DESDE' / 'Fecha desde'
+    - 'TASA DE USURA' / 'Tasa EA'
+    """
     df = pd.read_excel(path)
-    df["Fecha desde"] = pd.to_datetime(df["Fecha desde"]).dt.date
-    df = df.sort_values("Fecha desde")
+
+    # detectar columna de fecha
+    if "Fecha desde" in df.columns:
+        col_fecha = "Fecha desde"
+    elif "DESDE" in df.columns:
+        col_fecha = "DESDE"
+    else:
+        st.error(
+            "En TASAS_DE_USURA.xlsx no encontré columna de fecha "
+            "(esperaba 'Fecha desde' o 'DESDE'). "
+            f"Columnas: {list(df.columns)}"
+        )
+        st.stop()
+
+    # detectar columna de tasa
+    if "Tasa EA" in df.columns:
+        col_tasa = "Tasa EA"
+    elif "TASA DE USURA" in df.columns:
+        col_tasa = "TASA DE USURA"
+    else:
+        st.error(
+            "En TASAS_DE_USURA.xlsx no encontré columna de tasa "
+            "(esperaba 'Tasa EA' o 'TASA DE USURA'). "
+            f"Columnas: {list(df.columns)}"
+        )
+        st.stop()
+
+    # mapa meses en español -> inglés para parsear textos tipo '01-Dic-97'
+    meses = {
+        "Ene": "Jan", "Feb": "Feb", "Mar": "Mar", "Abr": "Apr",
+        "May": "May", "Jun": "Jun", "Jul": "Jul", "Ago": "Aug",
+        "Sep": "Sep", "Set": "Sep", "Oct": "Oct", "Nov": "Nov", "Dic": "Dec",
+    }
+
+    def parse_fecha(val):
+        if isinstance(val, (dt.date, dt.datetime)):
+            return val.date() if isinstance(val, dt.datetime) else val
+        s = str(val).strip()
+        for es, en in meses.items():
+            s = s.replace(es, en)
+        return pd.to_datetime(s, dayfirst=True).date()
+
+    df["fecha_desde"] = df[col_fecha].apply(parse_fecha)
+    df["tasa_ea"] = df[col_tasa].astype(float)
+
+    df = df[["fecha_desde", "tasa_ea"]].sort_values("fecha_desde").reset_index(drop=True)
     return df
 
 
-def obtener_tasa_ea(df_usura, fecha):
-    filtro = df_usura[df_usura["Fecha desde"] <= fecha]
+def obtener_tasa_ea(df_usura: pd.DataFrame, fecha: date) -> Decimal:
+    """
+    Devuelve la última tasa E.A. cuya fecha_desde <= fecha.
+    """
+    filtro = df_usura[df_usura["fecha_desde"] <= fecha]
     if filtro.empty:
-        st.error(f"No hay tasa de usura para la fecha {fecha}")
+        st.error(f"No hay tasa de usura para la fecha {fecha}. Revisa TASAS_DE_USURA.xlsx.")
         st.stop()
-    return Decimal(str(filtro.iloc[-1]["Tasa EA"]))
+    return Decimal(str(filtro.iloc[-1]["tasa_ea"]))
 
 
 # ======================
 #  MOTOR DE LIQUIDACIÓN
 # ======================
 
-def liquidar_obligacion(fila, df_usura, fecha_liquidacion):
+def liquidar_obligacion(fila: pd.Series, df_usura: pd.DataFrame, fecha_liquidacion: date):
+    """
+    Liquida una obligación usando:
+    - FECHA VENCIMIENTO PAGARÉ + 1 día -> fecha_intereses
+    - fecha_liquidacion (datepicker)
+    - capital: columna 'CAPITAL'
+    """
 
     capital = Decimal(str(fila["CAPITAL"]))
 
@@ -120,6 +193,7 @@ def liquidar_obligacion(fila, df_usura, fecha_liquidacion):
 
     while fecha_actual <= fecha_liquidacion:
 
+        # fin de mes
         fin_mes = (fecha_actual.replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)
         fecha_hasta = min(fin_mes, fecha_liquidacion)
 
@@ -127,6 +201,7 @@ def liquidar_obligacion(fila, df_usura, fecha_liquidacion):
 
         tasa_ea = obtener_tasa_ea(df_usura, fecha_actual)
 
+        # tasa diaria
         factor_dia = ((Decimal("1") + tasa_ea) ** (Decimal("1") / Decimal("365"))) - Decimal("1")
 
         interes_periodo = (capital * factor_dia * dias).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -167,10 +242,16 @@ def liquidar_obligacion(fila, df_usura, fecha_liquidacion):
 #  GENERADOR MEMORIAL
 # ======================
 
-def reemplazar(doc, placeholder, valor):
+def reemplazar(doc: Document, placeholder: str, valor: str):
+    """
+    Reemplaza un placeholder en todo el documento (párrafos y tablas).
+    """
+    # párrafos
     for p in doc.paragraphs:
         if placeholder in p.text:
             p.text = p.text.replace(placeholder, valor)
+
+    # tablas
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -178,9 +259,10 @@ def reemplazar(doc, placeholder, valor):
                     cell.text = cell.text.replace(placeholder, valor)
 
 
-def generar_memorial(resumen, df_detalle):
+def generar_memorial(resumen: dict, df_detalle: pd.DataFrame) -> bytes:
     doc = Document("FORMATO MEMORIAL APORTA LIQUIDACIÓN DE CRÉDITO.docx")
 
+    # Encabezado / datos proceso
     reemplazar(doc, "{{JUZGADO}}", resumen["juzgado"])
     reemplazar(doc, "{{CORREO_JUZGADO}}", resumen["correo_juzgado"])
     reemplazar(doc, "{{RADICADO}}", str(resumen["radicado"]))
@@ -188,27 +270,31 @@ def generar_memorial(resumen, df_detalle):
     reemplazar(doc, "{{CEDULA}}", str(resumen["cedula"]))
     reemplazar(doc, "{{PAGARE}}", str(resumen["pagaré"]))
 
+    # Fechas
     reemplazar(doc, "{{FECHA_INTERESES}}", resumen["fecha_intereses"].strftime("%d/%m/%Y"))
     reemplazar(doc, "{{FECHA_LIQUIDACION}}", resumen["fecha_liquidacion"].strftime("%d/%m/%Y"))
 
+    # Valores numéricos
     reemplazar(doc, "{{CAPITAL}}", f"${resumen['capital']:,.2f}")
     reemplazar(doc, "{{TOTAL_MORA}}", f"${resumen['total_mora']:,.2f}")
     reemplazar(doc, "{{SALDO_TOTAL}}", f"${resumen['saldo_total']:,.2f}")
 
+    # Valor en letras y numérico
     valor_letras = numero_a_letras_pesos(resumen["saldo_total"])
     reemplazar(doc, "{{VALOR_LETRAS}}", valor_letras)
     reemplazar(doc, "{{VALOR_NUM}}", f"${resumen['saldo_total']:,.2f}")
 
-    # SEGUNDA HOJA CON LA TABLA
+    # Segunda hoja con tabla de detalle
     doc.add_page_break()
     tabla = doc.add_table(rows=1, cols=7)
-    tabla.rows[0].cells[0].text = "Desde"
-    tabla.rows[0].cells[1].text = "Hasta"
-    tabla.rows[0].cells[2].text = "EA"
-    tabla.rows[0].cells[3].text = "Factor día"
-    tabla.rows[0].cells[4].text = "Días"
-    tabla.rows[0].cells[5].text = "Interés periodo"
-    tabla.rows[0].cells[6].text = "Acumulado"
+    hdr = tabla.rows[0].cells
+    hdr[0].text = "Desde"
+    hdr[1].text = "Hasta"
+    hdr[2].text = "EA"
+    hdr[3].text = "Factor día"
+    hdr[4].text = "Días"
+    hdr[5].text = "Interés periodo"
+    hdr[6].text = "Acumulado"
 
     for _, r in df_detalle.iterrows():
         row = tabla.add_row().cells
@@ -226,61 +312,85 @@ def generar_memorial(resumen, df_detalle):
 
 
 # ======================
-#  STREAMLIT UI
+#  INTERFAZ STREAMLIT
 # ======================
 
 st.title("💼 Liquidador Judicial Masivo – Banco GNB Sudameris")
 
 st.subheader("1️⃣ Cargar base de obligaciones")
-archivo_base = st.file_uploader("Sube el archivo Excel", type=["xlsx"])
+archivo_base = st.file_uploader("Sube el archivo Excel con la base", type=["xlsx"])
 
-if archivo_base:
+if archivo_base is not None:
     df_base = pd.read_excel(archivo_base)
-
     st.success(f"Base cargada con {len(df_base)} registros.")
+
+    # Validaciones básicas de columnas
+    columnas_necesarias = [
+        "NOMBRE", "CEDULA", "JUZGADO", "CORREO JUZGADO",
+        "RADICADO", "FECHA VENCIMIENTO PAGARÉ", "CAPITAL", "No. PAGARÉ"
+    ]
+    faltantes = [c for c in columnas_necesarias if c not in df_base.columns]
+    if faltantes:
+        st.error(f"Faltan columnas en la base: {faltantes}")
+        st.stop()
 
     st.subheader("2️⃣ Seleccionar fecha de liquidación")
     fecha_liquidacion = st.date_input("Fecha de liquidación", value=date.today())
 
     st.subheader("3️⃣ Cargar histórico de tasas de usura")
     df_usura = cargar_usura("TASAS_DE_USURA.xlsx")
-    st.success("Tasas de usura cargadas.")
+    st.success("Tasas de usura cargadas y normalizadas.")
 
-    st.subheader("4️⃣ Previsualizar obligación")
+    st.subheader("4️⃣ Previsualizar una obligación")
     lista_pagare = df_base["No. PAGARÉ"].astype(str).tolist()
-    pagare_sel = st.selectbox("Selecciona la obligación a revisar:", lista_pagare)
+    pagare_sel = st.selectbox("Selecciona la obligación (No. PAGARÉ) a revisar:", lista_pagare)
 
     fila_sel = df_base[df_base["No. PAGARÉ"].astype(str) == pagare_sel].iloc[0]
 
     df_detalle, resumen = liquidar_obligacion(fila_sel, df_usura, fecha_liquidacion)
 
-    st.write("### 🔍 Resumen de liquidación")
-    st.json(resumen)
+    st.markdown("### 🔍 Resumen de liquidación")
+    st.json({
+        "Cliente": resumen["nombre"],
+        "Identificación": resumen["cedula"],
+        "Obligación (No. PAGARÉ)": resumen["pagaré"],
+        "Fecha intereses": resumen["fecha_intereses"].strftime("%d/%m/%Y"),
+        "Fecha liquidación": resumen["fecha_liquidacion"].strftime("%d/%m/%Y"),
+        "Capital": f"${resumen['capital']:,.2f}",
+        "Total mora": f"${resumen['total_mora']:,.2f}",
+        "Saldo total": f"${resumen['saldo_total']:,.2f}",
+        "Valor en letras": numero_a_letras_pesos(resumen["saldo_total"])
+    })
 
-    st.write("### 📊 Detalle mensual")
+    st.markdown("### 📊 Detalle por períodos")
     st.dataframe(df_detalle)
 
-    st.subheader("5️⃣ Generar memorial")
-    if st.button("Generar memorial de ESTA obligación"):
+    st.subheader("5️⃣ Generar memorial para ESTA obligación")
+    if st.button("Generar memorial individual"):
         archivo = generar_memorial(resumen, df_detalle)
         st.download_button(
-            "Descargar memorial",
+            "📄 Descargar memorial",
             archivo,
-            file_name=f"MEMORIAL_{resumen['pagaré']}.docx"
+            file_name=f"MEMORIAL_{resumen['pagaré']}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
 
     st.subheader("6️⃣ Generar memoriales masivos")
-    if st.button("Generar TODOS los memoriales"):
+    if st.button("Generar memoriales para TODA la base"):
         mem_zip = io.BytesIO()
-        import zipfile
         with zipfile.ZipFile(mem_zip, "w") as z:
             for _, fila in df_base.iterrows():
                 df_d, res = liquidar_obligacion(fila, df_usura, fecha_liquidacion)
-                arc = generar_memorial(res, df_d)
-                z.writestr(f"MEMORIAL_{res['pagaré']}.docx", arc)
+                doc_bytes = generar_memorial(res, df_d)
+                nombre_archivo = f"MEMORIAL_{res['pagaré']}.docx"
+                z.writestr(nombre_archivo, doc_bytes)
 
+        mem_zip.seek(0)
         st.download_button(
-            "Descargar ZIP de memoriales",
+            "📦 Descargar ZIP de memoriales",
             mem_zip.getvalue(),
-            file_name="MEMORIALES_GNB.zip"
+            file_name="MEMORIALES_GNB.zip",
+            mime="application/zip"
         )
+else:
+    st.info("Sube primero la base de obligaciones en formato .xlsx.")

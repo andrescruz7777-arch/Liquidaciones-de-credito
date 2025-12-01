@@ -6,6 +6,49 @@ from docx import Document
 import io
 import zipfile
 import datetime as dt
+from pathlib import Path
+
+BASE_DIR = Path(__file__).parent
+
+# ======================
+#  UTILIDAD: PLANTILLA
+# ======================
+
+def obtener_ruta_plantilla() -> str:
+    """
+    Busca archivos .docx en la raíz del repo y retorna la ruta
+    del que contenga 'FORMATO MEMORIAL APORTA LIQUIDACIÓN DE CRÉDITO'
+    en su nombre. Además, lista en la barra lateral lo que encuentra.
+    """
+    docx_files = list(BASE_DIR.glob("*.docx"))
+
+    st.sidebar.markdown("### 📂 .docx encontrados en la raíz:")
+    if not docx_files:
+        st.sidebar.write("No se encontró ningún .docx")
+        st.error(
+            "No encontré NINGÚN archivo .docx en la raíz del repo.\n\n"
+            "Verifica en GitHub que subiste "
+            "'FORMATO MEMORIAL APORTA LIQUIDACIÓN DE CRÉDITO.docx' "
+            "a la raíz del proyecto."
+        )
+        st.stop()
+    else:
+        for p in docx_files:
+            st.sidebar.write("•", p.name)
+
+    for p in docx_files:
+        if "FORMATO MEMORIAL APORTA LIQUIDACIÓN DE CRÉDITO" in p.stem:
+            return str(p)
+
+    st.error(
+        "No encontré la plantilla esperada.\n\n"
+        "Buscaba un archivo cuyo nombre contenga:\n"
+        "  'FORMATO MEMORIAL APORTA LIQUIDACIÓN DE CRÉDITO'\n\n"
+        "Pero solo encontré estos .docx:\n"
+        + "\n".join(f"- {p.name}" for p in docx_files)
+    )
+    st.stop()
+
 
 # ======================
 #  UTILIDADES DE TEXTO
@@ -55,12 +98,6 @@ def numero_a_letras_centavos(n: int) -> str:
 
 
 def numero_a_letras_pesos(valor: float) -> str:
-    """
-    Ejemplo:
-    65331719.38 ->
-    'sesenta y cinco millones trescientos treinta y un mil
-     setecientos diecinueve pesos con treinta y ocho centavos'
-    """
     v = Decimal(str(valor)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     entero = int(v)
     centavos = int((v - Decimal(entero)) * 100)
@@ -69,22 +106,18 @@ def numero_a_letras_pesos(valor: float) -> str:
     miles, unidades = divmod(resto, 1_000)
 
     partes = []
-
-    # Millones
     if millones > 0:
         if millones == 1:
             partes.append("un millón")
         else:
             partes.append(numero_a_letras_menor_1000(millones) + " millones")
 
-    # Miles
     if miles > 0:
         if miles == 1:
             partes.append("mil")
         else:
             partes.append(numero_a_letras_menor_1000(miles) + " mil")
 
-    # Unidades
     if unidades > 0 or entero == 0:
         partes.append(numero_a_letras_menor_1000(unidades))
 
@@ -101,17 +134,8 @@ def numero_a_letras_pesos(valor: float) -> str:
 # ======================
 
 def cargar_usura(path: str) -> pd.DataFrame:
-    """
-    Lee TASAS_DE_USURA.xlsx y normaliza a columnas:
-    - fecha_desde (date)
-    - tasa_ea (decimal E.A.)
-    Soporta archivos con columnas:
-    - 'DESDE' / 'Fecha desde'
-    - 'TASA DE USURA' / 'Tasa EA'
-    """
     df = pd.read_excel(path)
 
-    # detectar columna de fecha
     if "Fecha desde" in df.columns:
         col_fecha = "Fecha desde"
     elif "DESDE" in df.columns:
@@ -124,7 +148,6 @@ def cargar_usura(path: str) -> pd.DataFrame:
         )
         st.stop()
 
-    # detectar columna de tasa
     if "Tasa EA" in df.columns:
         col_tasa = "Tasa EA"
     elif "TASA DE USURA" in df.columns:
@@ -137,7 +160,6 @@ def cargar_usura(path: str) -> pd.DataFrame:
         )
         st.stop()
 
-    # mapa meses en español -> inglés para parsear textos tipo '01-Dic-97'
     meses = {
         "Ene": "Jan", "Feb": "Feb", "Mar": "Mar", "Abr": "Apr",
         "May": "May", "Jun": "Jun", "Jul": "Jul", "Ago": "Aug",
@@ -160,9 +182,6 @@ def cargar_usura(path: str) -> pd.DataFrame:
 
 
 def obtener_tasa_ea(df_usura: pd.DataFrame, fecha: date) -> Decimal:
-    """
-    Devuelve la última tasa E.A. cuya fecha_desde <= fecha.
-    """
     filtro = df_usura[df_usura["fecha_desde"] <= fecha]
     if filtro.empty:
         st.error(f"No hay tasa de usura para la fecha {fecha}. Revisa TASAS_DE_USURA.xlsx.")
@@ -175,13 +194,6 @@ def obtener_tasa_ea(df_usura: pd.DataFrame, fecha: date) -> Decimal:
 # ======================
 
 def liquidar_obligacion(fila: pd.Series, df_usura: pd.DataFrame, fecha_liquidacion: date):
-    """
-    Liquida una obligación usando:
-    - FECHA VENCIMIENTO PAGARÉ + 1 día -> fecha_intereses
-    - fecha_liquidacion (datepicker)
-    - capital: columna 'CAPITAL'
-    """
-
     capital = Decimal(str(fila["CAPITAL"]))
 
     fecha_venc = pd.to_datetime(fila["FECHA VENCIMIENTO PAGARÉ"]).date()
@@ -192,16 +204,12 @@ def liquidar_obligacion(fila: pd.Series, df_usura: pd.DataFrame, fecha_liquidaci
     filas = []
 
     while fecha_actual <= fecha_liquidacion:
-
-        # fin de mes
         fin_mes = (fecha_actual.replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)
         fecha_hasta = min(fin_mes, fecha_liquidacion)
 
         dias = (fecha_hasta - fecha_actual).days + 1
 
         tasa_ea = obtener_tasa_ea(df_usura, fecha_actual)
-
-        # tasa diaria
         factor_dia = ((Decimal("1") + tasa_ea) ** (Decimal("1") / Decimal("365"))) - Decimal("1")
 
         interes_periodo = (capital * factor_dia * dias).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -243,15 +251,9 @@ def liquidar_obligacion(fila: pd.Series, df_usura: pd.DataFrame, fecha_liquidaci
 # ======================
 
 def reemplazar(doc: Document, placeholder: str, valor: str):
-    """
-    Reemplaza un placeholder en todo el documento (párrafos y tablas).
-    """
-    # párrafos
     for p in doc.paragraphs:
         if placeholder in p.text:
             p.text = p.text.replace(placeholder, valor)
-
-    # tablas
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -260,9 +262,9 @@ def reemplazar(doc: Document, placeholder: str, valor: str):
 
 
 def generar_memorial(resumen: dict, df_detalle: pd.DataFrame) -> bytes:
-    doc = Document("FORMATO MEMORIAL APORTA LIQUIDACIÓN DE CRÉDITO.docx")
+    ruta_plantilla = obtener_ruta_plantilla()
+    doc = Document(ruta_plantilla)
 
-    # Encabezado / datos proceso
     reemplazar(doc, "{{JUZGADO}}", resumen["juzgado"])
     reemplazar(doc, "{{CORREO_JUZGADO}}", resumen["correo_juzgado"])
     reemplazar(doc, "{{RADICADO}}", str(resumen["radicado"]))
@@ -270,21 +272,18 @@ def generar_memorial(resumen: dict, df_detalle: pd.DataFrame) -> bytes:
     reemplazar(doc, "{{CEDULA}}", str(resumen["cedula"]))
     reemplazar(doc, "{{PAGARE}}", str(resumen["pagaré"]))
 
-    # Fechas
     reemplazar(doc, "{{FECHA_INTERESES}}", resumen["fecha_intereses"].strftime("%d/%m/%Y"))
     reemplazar(doc, "{{FECHA_LIQUIDACION}}", resumen["fecha_liquidacion"].strftime("%d/%m/%Y"))
 
-    # Valores numéricos
     reemplazar(doc, "{{CAPITAL}}", f"${resumen['capital']:,.2f}")
     reemplazar(doc, "{{TOTAL_MORA}}", f"${resumen['total_mora']:,.2f}")
     reemplazar(doc, "{{SALDO_TOTAL}}", f"${resumen['saldo_total']:,.2f}")
 
-    # Valor en letras y numérico
     valor_letras = numero_a_letras_pesos(resumen["saldo_total"])
     reemplazar(doc, "{{VALOR_LETRAS}}", valor_letras)
     reemplazar(doc, "{{VALOR_NUM}}", f"${resumen['saldo_total']:,.2f}")
 
-    # Segunda hoja con tabla de detalle
+    # Segunda hoja
     doc.add_page_break()
     tabla = doc.add_table(rows=1, cols=7)
     hdr = tabla.rows[0].cells
@@ -324,7 +323,6 @@ if archivo_base is not None:
     df_base = pd.read_excel(archivo_base)
     st.success(f"Base cargada con {len(df_base)} registros.")
 
-    # Validaciones básicas de columnas
     columnas_necesarias = [
         "NOMBRE", "CEDULA", "JUZGADO", "CORREO JUZGADO",
         "RADICADO", "FECHA VENCIMIENTO PAGARÉ", "CAPITAL", "No. PAGARÉ"
@@ -363,7 +361,14 @@ if archivo_base is not None:
     })
 
     st.markdown("### 📊 Detalle por períodos")
-    st.dataframe(df_detalle)
+
+    df_vista = df_detalle.copy()
+    df_vista["tasa_ea"] = df_vista["tasa_ea"].map(lambda x: f"{x*100:.2f}%")
+    df_vista["factor_dia"] = df_vista["factor_dia"].map(lambda x: f"{x*100:.5f}%")
+    df_vista["interes_periodo"] = df_vista["interes_periodo"].map(lambda x: f"${x:,.2f}")
+    df_vista["interes_acumulado"] = df_vista["interes_acumulado"].map(lambda x: f"${x:,.2f}")
+
+    st.dataframe(df_vista)
 
     st.subheader("5️⃣ Generar memorial para ESTA obligación")
     if st.button("Generar memorial individual"):

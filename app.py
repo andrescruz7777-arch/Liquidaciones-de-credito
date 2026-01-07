@@ -8,6 +8,9 @@ import zipfile
 import datetime as dt
 from pathlib import Path
 
+# ✅ Para detectar saltos de página en Word (evitar hoja en blanco)
+from docx.oxml.ns import qn
+
 BASE_DIR = Path(__file__).parent
 
 # ============================================
@@ -220,28 +223,138 @@ def liquidar_obligacion(fila, df_usura, fecha_liq):
 
 
 # ============================================
-#   5. GENERADOR DE MEMORIAL
+#   5. WORD: REEMPLAZO SIN PERDER FORMATO
+#      + SALTOS DE PÁGINA SIN HOJA EN BLANCO
 # ============================================
 
+def _copiar_formato(origen_run, destino_run):
+    destino_run.bold = origen_run.bold
+    destino_run.italic = origen_run.italic
+    destino_run.underline = origen_run.underline
+    destino_run.font.name = origen_run.font.name
+    destino_run.font.size = origen_run.font.size
+    if origen_run.font.color and origen_run.font.color.rgb:
+        destino_run.font.color.rgb = origen_run.font.color.rgb
+
+def _replace_placeholder_en_parrafo(paragraph, placeholder: str, value: str):
+    full_text = "".join(r.text for r in paragraph.runs)
+    if placeholder not in full_text:
+        return
+
+    start = full_text.find(placeholder)
+    end = start + len(placeholder)
+
+    idx = 0
+    runs = paragraph.runs
+    first_run_idx = last_run_idx = None
+    start_in_run = end_in_run = None
+
+    for i, r in enumerate(runs):
+        run_len = len(r.text)
+        run_start = idx
+        run_end = idx + run_len
+
+        if first_run_idx is None and start >= run_start and start <= run_end:
+            first_run_idx = i
+            start_in_run = start - run_start
+
+        if first_run_idx is not None and end >= run_start and end <= run_end:
+            last_run_idx = i
+            end_in_run = end - run_start
+            break
+
+        idx += run_len
+
+    if first_run_idx is None or last_run_idx is None:
+        return
+
+    # Placeholder en un solo run
+    if first_run_idx == last_run_idx:
+        r = runs[first_run_idx]
+        r.text = r.text[:start_in_run] + value + r.text[end_in_run:]
+        return
+
+    # Placeholder atraviesa runs
+    first_run = runs[first_run_idx]
+    last_run = runs[last_run_idx]
+
+    prefix = first_run.text[:start_in_run]
+    suffix = last_run.text[end_in_run:]
+
+    first_run.text = prefix
+    for j in range(first_run_idx + 1, last_run_idx):
+        runs[j].text = ""
+    last_run.text = suffix
+
+    new_run = paragraph.add_run(value)
+    _copiar_formato(first_run, new_run)
+    first_run._element.addnext(new_run._element)
+
 def reemplazar(doc, placeholder, valor):
+    # Párrafos
     for p in doc.paragraphs:
-        if placeholder in p.text:
-            p.text = p.text.replace(placeholder, valor)
+        _replace_placeholder_en_parrafo(p, placeholder, valor)
+
+    # Tablas
     for t in doc.tables:
-        for r in t.rows:
-            for c in r.cells:
-                if placeholder in c.text:
-                    c.text = c.text.replace(placeholder, valor)
+        for row in t.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    _replace_placeholder_en_parrafo(p, placeholder, valor)
+
+def _tiene_page_break(paragraph) -> bool:
+    for br in paragraph._p.xpath(".//w:br"):
+        if br.get(qn("w:type")) == "page":
+            return True
+    return False
+
+def _limpiar_parrafos_vacios_final(doc, max_limpiar=30):
+    count = 0
+    while doc.paragraphs and count < max_limpiar:
+        p = doc.paragraphs[-1]
+        texto = (p.text or "").strip()
+        if texto == "" and not _tiene_page_break(p):
+            p._element.getparent().remove(p._element)
+            count += 1
+        else:
+            break
+
+def add_page_break_if_needed(doc):
+    """
+    Evita hoja en blanco:
+    - limpia párrafos vacíos finales
+    - si ya hay salto de página al final, NO agrega otro
+    - si el último párrafo está vacío, no agrega salto extra
+    """
+    _limpiar_parrafos_vacios_final(doc)
+
+    if not doc.paragraphs:
+        doc.add_page_break()
+        return
+
+    last_p = doc.paragraphs[-1]
+    if _tiene_page_break(last_p):
+        return
+
+    if (last_p.text or "").strip() == "":
+        return
+
+    doc.add_page_break()
+
+
+# ============================================
+#   6. GENERADOR DE MEMORIAL
+# ============================================
 
 def generar_memorial(resumen, df_detalle):
 
     ruta = obtener_ruta_plantilla()
     doc = Document(ruta)
 
-    reemplazar(doc, "{{JUZGADO}}", resumen["juzgado"])
-    reemplazar(doc, "{{CORREO_JUZGADO}}", resumen["correo_juzgado"])
+    reemplazar(doc, "{{JUZGADO}}", str(resumen["juzgado"]))
+    reemplazar(doc, "{{CORREO_JUZGADO}}", str(resumen["correo_juzgado"]))
     reemplazar(doc, "{{RADICADO}}", str(resumen["radicado"]))
-    reemplazar(doc, "{{NOMBRE}}", resumen["nombre"])
+    reemplazar(doc, "{{NOMBRE}}", str(resumen["nombre"]))
     reemplazar(doc, "{{CEDULA}}", str(resumen["cedula"]))
     reemplazar(doc, "{{PAGARE}}", str(resumen["pagaré"]))
 
@@ -252,12 +365,15 @@ def generar_memorial(resumen, df_detalle):
     reemplazar(doc, "{{TOTAL_MORA}}", f"${resumen['total_mora']:,.2f}")
     reemplazar(doc, "{{SALDO_TOTAL}}", f"${resumen['saldo_total']:,.2f}")
 
-    letras = numero_a_letras_pesos(resumen["saldo_total"])
+    # ✅ MAYÚSCULAS para {{VALOR_LETRAS}}
+    letras = numero_a_letras_pesos(resumen["saldo_total"]).upper()
     reemplazar(doc, "{{VALOR_LETRAS}}", letras)
     reemplazar(doc, "{{VALOR_NUM}}", f"${resumen['saldo_total']:,.2f}")
 
+    # ✅ Evitar hoja en blanco
+    add_page_break_if_needed(doc)
+
     # TABLA DETALLE
-    doc.add_page_break()
     tabla = doc.add_table(rows=1, cols=7)
     h = tabla.rows[0].cells
     h[0].text, h[1].text, h[2].text, h[3].text, h[4].text, h[5].text, h[6].text = (
@@ -280,7 +396,7 @@ def generar_memorial(resumen, df_detalle):
 
 
 # ============================================
-#   6. INTERFAZ STREAMLIT
+#   7. INTERFAZ STREAMLIT
 # ============================================
 
 st.title("💼 Liquidador Judicial Masivo – Banco GNB Sudameris")
@@ -315,7 +431,6 @@ if archivo_base:
     pag = st.selectbox("Obligación:", lista_pagare)
 
     fila = df_base[df_base["No. PAGARÉ"].astype(str) == pag].iloc[0]
-
     df_det, resumen = liquidar_obligacion(fila, df_usura, fecha_liq)
 
     st.markdown("### 🔍 Resumen")
@@ -328,7 +443,7 @@ if archivo_base:
         "Capital": f"${resumen['capital']:,.2f}",
         "Total mora": f"${resumen['total_mora']:,.2f}",
         "Saldo total": f"${resumen['saldo_total']:,.2f}",
-        "En letras": numero_a_letras_pesos(resumen["saldo_total"])
+        "En letras (MAYÚSCULAS)": numero_a_letras_pesos(resumen["saldo_total"]).upper()
     })
 
     st.markdown("### 📊 Detalle por períodos")
@@ -358,6 +473,7 @@ if archivo_base:
                 archivo = generar_memorial(res, det)
                 nombre = f"MEMORIAL_{res['pagaré']}.docx"
                 z.writestr(nombre, archivo)
+
         buffer.seek(0)
         st.download_button(
             "📦 Descargar ZIP",

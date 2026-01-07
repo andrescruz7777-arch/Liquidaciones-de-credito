@@ -8,8 +8,7 @@ import zipfile
 import datetime as dt
 from pathlib import Path
 
-# ✅ Word helpers
-from docx.oxml.ns import qn
+# Word helpers
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 BASE_DIR = Path(__file__).parent
@@ -19,10 +18,6 @@ BASE_DIR = Path(__file__).parent
 # ============================================
 
 def obtener_ruta_plantilla() -> str:
-    """
-    Usa el primer archivo .docx que encuentre en la raíz del repo.
-    Esto elimina el problema de acentos Unicode diferentes.
-    """
     docx_files = list(BASE_DIR.glob("*.docx"))
 
     st.sidebar.markdown("### 📂 Archivos .docx encontrados:")
@@ -39,7 +34,6 @@ def obtener_ruta_plantilla() -> str:
 
     plantilla = docx_files[0]
     st.sidebar.markdown(f"**✔ Usando plantilla:** {plantilla.name}")
-
     return str(plantilla)
 
 
@@ -118,7 +112,6 @@ def numero_a_letras_pesos(valor: float) -> str:
 def cargar_usura(path: str):
     df = pd.read_excel(path)
 
-    # Buscar columna fecha
     if "Fecha desde" in df.columns:
         col_f = "Fecha desde"
     elif "DESDE" in df.columns:
@@ -127,7 +120,6 @@ def cargar_usura(path: str):
         st.error("No encontré columna de fecha en TASAS_DE_USURA.xlsx")
         st.stop()
 
-    # Buscar columna tasa
     if "Tasa EA" in df.columns:
         col_t = "Tasa EA"
     elif "TASA DE USURA" in df.columns:
@@ -152,7 +144,6 @@ def cargar_usura(path: str):
 
     df["fecha_desde"] = df[col_f].apply(parse_fecha)
     df["tasa_ea"] = df[col_t].astype(float)
-
     df = df[["fecha_desde", "tasa_ea"]].sort_values("fecha_desde").reset_index(drop=True)
     return df
 
@@ -224,7 +215,7 @@ def liquidar_obligacion(fila, df_usura, fecha_liq):
 
 
 # ============================================
-#   5. WORD: REEMPLAZO SIN PERDER FORMATO
+#   5. WORD: REEMPLAZO SIN ROMPER FORMATO
 # ============================================
 
 def _copiar_formato(origen_run, destino_run):
@@ -268,11 +259,13 @@ def _replace_placeholder_en_parrafo(paragraph, placeholder: str, value: str):
     if first_run_idx is None or last_run_idx is None:
         return
 
+    # Placeholder en un solo run
     if first_run_idx == last_run_idx:
         r = runs[first_run_idx]
         r.text = r.text[:start_in_run] + value + r.text[end_in_run:]
         return
 
+    # Placeholder atraviesa varios runs
     first_run = runs[first_run_idx]
     last_run = runs[last_run_idx]
 
@@ -298,60 +291,20 @@ def reemplazar(doc, placeholder, valor):
                 for p in cell.paragraphs:
                     _replace_placeholder_en_parrafo(p, placeholder, valor)
 
-
-# ============================================
-#   6. WORD: SALTO DE PÁGINA SIN HOJA EN BLANCO
-# ============================================
-
-def _tiene_page_break(paragraph) -> bool:
-    for br in paragraph._p.xpath(".//w:br"):
-        if br.get(qn("w:type")) == "page":
-            return True
-    return False
-
-def _tiene_section_break_next_page(paragraph) -> bool:
-    sects = paragraph._p.xpath(".//w:sectPr")
-    if not sects:
-        return False
-    for sect in sects:
-        t = sect.xpath(".//w:type")
-        if t and t[0].get(qn("w:val")) == "nextPage":
-            return True
-        if not t:
-            return True
-    return False
-
-def _limpiar_parrafos_vacios_final(doc, max_limpiar=50):
+def limpiar_parrafos_vacios_final(doc, max_limpiar=80):
+    # Limpieza agresiva de párrafos vacíos al final (evita páginas raras)
     count = 0
     while doc.paragraphs and count < max_limpiar:
         p = doc.paragraphs[-1]
-        txt = (p.text or "").strip()
-        if txt == "" and (not _tiene_page_break(p)) and (not _tiene_section_break_next_page(p)):
+        if (p.text or "").strip() == "":
             p._element.getparent().remove(p._element)
             count += 1
         else:
             break
 
-def add_page_break_if_needed(doc):
-    _limpiar_parrafos_vacios_final(doc)
-
-    if not doc.paragraphs:
-        doc.add_page_break()
-        return
-
-    last_p = doc.paragraphs[-1]
-
-    if _tiene_page_break(last_p) or _tiene_section_break_next_page(last_p):
-        return
-
-    if (last_p.text or "").strip() == "":
-        return
-
-    doc.add_page_break()
-
 
 # ============================================
-#   7. WORD: ESTILO PARA LA TABLA DE LIQUIDACIÓN
+#   6. TABLA: FORMATO
 # ============================================
 
 def aplicar_estilo_tabla(tabla):
@@ -369,14 +322,13 @@ def aplicar_estilo_tabla(tabla):
             continue
 
     # Encabezado: negrilla y centrado
-    header_cells = tabla.rows[0].cells
-    for cell in header_cells:
+    for cell in tabla.rows[0].cells:
         for p in cell.paragraphs:
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             for run in p.runs:
                 run.bold = True
 
-    # Cuerpo: centrado/der según columna
+    # Cuerpo: columnas centradas y valores a la derecha
     for row in tabla.rows[1:]:
         for i, cell in enumerate(row.cells):
             for p in cell.paragraphs:
@@ -387,11 +339,10 @@ def aplicar_estilo_tabla(tabla):
 
 
 # ============================================
-#   8. GENERADOR DE MEMORIAL
+#   7. GENERADOR DE MEMORIAL
 # ============================================
 
 def generar_memorial(resumen, df_detalle):
-
     ruta = obtener_ruta_plantilla()
     doc = Document(ruta)
 
@@ -414,10 +365,12 @@ def generar_memorial(resumen, df_detalle):
     reemplazar(doc, "{{VALOR_LETRAS}}", letras)
     reemplazar(doc, "{{VALOR_NUM}}", f"${resumen['saldo_total']:,.2f}")
 
-    # ✅ Salto de página sin hoja en blanco
-    add_page_break_if_needed(doc)
+    # ✅ Limpieza final (evita acumulación de enters que generan páginas vacías)
+    limpiar_parrafos_vacios_final(doc)
 
-    # TABLA DETALLE
+    # ✅ NO forzamos salto de página: Word baja la tabla si no cabe (sin páginas en blanco)
+    doc.add_paragraph("")  # separador suave
+
     tabla = doc.add_table(rows=1, cols=7)
     h = tabla.rows[0].cells
     h[0].text, h[1].text, h[2].text, h[3].text, h[4].text, h[5].text, h[6].text = (
@@ -434,7 +387,6 @@ def generar_memorial(resumen, df_detalle):
         row[5].text = f"${r['interes_periodo']:,.2f}"
         row[6].text = f"${r['interes_acumulado']:,.2f}"
 
-    # ✅ Aplica estilo a la tabla (encabezado en negrilla + alineaciones)
     aplicar_estilo_tabla(tabla)
 
     output = io.BytesIO()
@@ -443,7 +395,7 @@ def generar_memorial(resumen, df_detalle):
 
 
 # ============================================
-#   9. INTERFAZ STREAMLIT
+#   8. INTERFAZ STREAMLIT
 # ============================================
 
 st.title("💼 Liquidador Judicial Masivo – Banco GNB Sudameris")
@@ -455,7 +407,6 @@ if archivo_base:
     df_base = pd.read_excel(archivo_base)
     st.success(f"Base cargada: {len(df_base)} registros")
 
-    # Validaciones
     cols = [
         "NOMBRE", "CEDULA", "JUZGADO", "CORREO JUZGADO",
         "RADICADO", "FECHA VENCIMIENTO PAGARÉ",
@@ -528,6 +479,5 @@ if archivo_base:
             file_name="MEMORIALES_GNB.zip",
             mime="application/zip"
         )
-
 else:
     st.info("Sube primero la base .xlsx para comenzar.")

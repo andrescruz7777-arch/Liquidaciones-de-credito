@@ -8,8 +8,9 @@ import zipfile
 import datetime as dt
 from pathlib import Path
 
-# ✅ Para detectar saltos de página en Word (evitar hoja en blanco)
+# ✅ Word helpers
 from docx.oxml.ns import qn
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 BASE_DIR = Path(__file__).parent
 
@@ -224,7 +225,6 @@ def liquidar_obligacion(fila, df_usura, fecha_liq):
 
 # ============================================
 #   5. WORD: REEMPLAZO SIN PERDER FORMATO
-#      + SALTOS DE PÁGINA SIN HOJA EN BLANCO
 # ============================================
 
 def _copiar_formato(origen_run, destino_run):
@@ -268,13 +268,11 @@ def _replace_placeholder_en_parrafo(paragraph, placeholder: str, value: str):
     if first_run_idx is None or last_run_idx is None:
         return
 
-    # Placeholder en un solo run
     if first_run_idx == last_run_idx:
         r = runs[first_run_idx]
         r.text = r.text[:start_in_run] + value + r.text[end_in_run:]
         return
 
-    # Placeholder atraviesa runs
     first_run = runs[first_run_idx]
     last_run = runs[last_run_idx]
 
@@ -291,16 +289,19 @@ def _replace_placeholder_en_parrafo(paragraph, placeholder: str, value: str):
     first_run._element.addnext(new_run._element)
 
 def reemplazar(doc, placeholder, valor):
-    # Párrafos
     for p in doc.paragraphs:
         _replace_placeholder_en_parrafo(p, placeholder, valor)
 
-    # Tablas
     for t in doc.tables:
         for row in t.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
                     _replace_placeholder_en_parrafo(p, placeholder, valor)
+
+
+# ============================================
+#   6. WORD: SALTO DE PÁGINA SIN HOJA EN BLANCO
+# ============================================
 
 def _tiene_page_break(paragraph) -> bool:
     for br in paragraph._p.xpath(".//w:br"):
@@ -308,24 +309,30 @@ def _tiene_page_break(paragraph) -> bool:
             return True
     return False
 
-def _limpiar_parrafos_vacios_final(doc, max_limpiar=30):
+def _tiene_section_break_next_page(paragraph) -> bool:
+    sects = paragraph._p.xpath(".//w:sectPr")
+    if not sects:
+        return False
+    for sect in sects:
+        t = sect.xpath(".//w:type")
+        if t and t[0].get(qn("w:val")) == "nextPage":
+            return True
+        if not t:
+            return True
+    return False
+
+def _limpiar_parrafos_vacios_final(doc, max_limpiar=50):
     count = 0
     while doc.paragraphs and count < max_limpiar:
         p = doc.paragraphs[-1]
-        texto = (p.text or "").strip()
-        if texto == "" and not _tiene_page_break(p):
+        txt = (p.text or "").strip()
+        if txt == "" and (not _tiene_page_break(p)) and (not _tiene_section_break_next_page(p)):
             p._element.getparent().remove(p._element)
             count += 1
         else:
             break
 
 def add_page_break_if_needed(doc):
-    """
-    Evita hoja en blanco:
-    - limpia párrafos vacíos finales
-    - si ya hay salto de página al final, NO agrega otro
-    - si el último párrafo está vacío, no agrega salto extra
-    """
     _limpiar_parrafos_vacios_final(doc)
 
     if not doc.paragraphs:
@@ -333,7 +340,8 @@ def add_page_break_if_needed(doc):
         return
 
     last_p = doc.paragraphs[-1]
-    if _tiene_page_break(last_p):
+
+    if _tiene_page_break(last_p) or _tiene_section_break_next_page(last_p):
         return
 
     if (last_p.text or "").strip() == "":
@@ -343,7 +351,43 @@ def add_page_break_if_needed(doc):
 
 
 # ============================================
-#   6. GENERADOR DE MEMORIAL
+#   7. WORD: ESTILO PARA LA TABLA DE LIQUIDACIÓN
+# ============================================
+
+def aplicar_estilo_tabla(tabla):
+    estilos_preferidos = [
+        "Table Grid",
+        "Grid Table 4 Accent 1",
+        "Light Shading Accent 1",
+        "Light List Accent 1",
+    ]
+    for s in estilos_preferidos:
+        try:
+            tabla.style = s
+            break
+        except Exception:
+            continue
+
+    # Encabezado: negrilla y centrado
+    header_cells = tabla.rows[0].cells
+    for cell in header_cells:
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.bold = True
+
+    # Cuerpo: centrado/der según columna
+    for row in tabla.rows[1:]:
+        for i, cell in enumerate(row.cells):
+            for p in cell.paragraphs:
+                if i in (0, 1, 2, 3, 4):
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                else:
+                    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+
+
+# ============================================
+#   8. GENERADOR DE MEMORIAL
 # ============================================
 
 def generar_memorial(resumen, df_detalle):
@@ -365,12 +409,12 @@ def generar_memorial(resumen, df_detalle):
     reemplazar(doc, "{{TOTAL_MORA}}", f"${resumen['total_mora']:,.2f}")
     reemplazar(doc, "{{SALDO_TOTAL}}", f"${resumen['saldo_total']:,.2f}")
 
-    # ✅ MAYÚSCULAS para {{VALOR_LETRAS}}
+    # ✅ MAYÚSCULAS
     letras = numero_a_letras_pesos(resumen["saldo_total"]).upper()
     reemplazar(doc, "{{VALOR_LETRAS}}", letras)
     reemplazar(doc, "{{VALOR_NUM}}", f"${resumen['saldo_total']:,.2f}")
 
-    # ✅ Evitar hoja en blanco
+    # ✅ Salto de página sin hoja en blanco
     add_page_break_if_needed(doc)
 
     # TABLA DETALLE
@@ -390,13 +434,16 @@ def generar_memorial(resumen, df_detalle):
         row[5].text = f"${r['interes_periodo']:,.2f}"
         row[6].text = f"${r['interes_acumulado']:,.2f}"
 
+    # ✅ Aplica estilo a la tabla (encabezado en negrilla + alineaciones)
+    aplicar_estilo_tabla(tabla)
+
     output = io.BytesIO()
     doc.save(output)
     return output.getvalue()
 
 
 # ============================================
-#   7. INTERFAZ STREAMLIT
+#   9. INTERFAZ STREAMLIT
 # ============================================
 
 st.title("💼 Liquidador Judicial Masivo – Banco GNB Sudameris")
